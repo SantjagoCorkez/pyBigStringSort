@@ -7,44 +7,106 @@
 #define PyBytesObject_SIZE (offsetof(PyBytesObject, ob_sval) + 1)
 #define BIG_STRING_SORT_BUFSIZE 1 << 20 // 1 MiB
 
-static size_t counters[256] = {0};
+// 0.1 of a second
+static const struct timespec err_recovery_time = {
+    .tv_sec = 0,
+    .tv_nsec = 100000000
+};
 
 PyObject *BigStringSort_call(__attribute__((unused)) PyObject *self, PyObject *arg) {
-    char *path = PyUnicode_AsUTF8(arg);  // uses Py_LIMITED_API function, though still works on CPython3.9
+    PyThreadState *_save = PyEval_SaveThread();
+    size_t counters[256] = {0};
+
+    char *path;
+    // uses Py_LIMITED_API function, though still works on CPython3.9
+    if ( (path = PyUnicode_AsUTF8(arg)) == NULL ) {
+        PyEval_RestoreThread(_save);
+        return NULL;
+    }
     FILE *fd;
     if ( !(fd = fopen(path, "r")) ) {
+        PyEval_RestoreThread(_save);
         PyErr_SetFromErrno(PyExc_OSError);
         return NULL;
     }
 
     struct stat path_stat;
-    stat(path, &path_stat);
+    if ( stat(path, &path_stat) ) {
+        fclose(fd);
+        PyEval_RestoreThread(_save);
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
     if ( ( size_t ) path_stat.st_size > ( size_t ) PY_SSIZE_T_MAX - PyBytesObject_SIZE ) {
+        fclose(fd);
+        PyEval_RestoreThread(_save);
         PyErr_SetString(PyExc_OverflowError,
                         "byte string is too large");
         return NULL;
     }
 
-    PyBytesObject *retval = ( PyBytesObject * ) PyObject_Malloc(PyBytesObject_SIZE + path_stat.st_size);
-    if ( retval == NULL ) {
+    PyBytesObject *retval;
+    if ( (retval = ( PyBytesObject * ) PyObject_Malloc(PyBytesObject_SIZE + path_stat.st_size)) == NULL ) {
+        fclose(fd);
+        PyEval_RestoreThread(_save);
         return PyErr_NoMemory();
     }
 
     size_t to_read = path_stat.st_size;
-    uint8_t *buf = malloc(BIG_STRING_SORT_BUFSIZE);
-    memset(counters, 0, sizeof(counters));
+    uint8_t *buf = NULL;
+    if ( (buf = malloc(BIG_STRING_SORT_BUFSIZE)) == NULL ) {
+        PyEval_RestoreThread(_save);
+        PyErr_SetFromErrno(PyExc_OSError);
+        goto err_obj_cleanup;
+    }
+    uint8_t err_count = 0;
     while ( to_read ) {
         size_t chunk_size = fread(buf, 1, BIG_STRING_SORT_BUFSIZE, fd);
+        if ( chunk_size != BIG_STRING_SORT_BUFSIZE && chunk_size != to_read ) {
+            if ( feof(fd) ) {
+                PyEval_RestoreThread(_save);
+                PyErr_SetString(PyExc_BrokenPipeError, "File was shrunk while being read");
+                goto err_buf_cleanup;
+            }
+            if ( ferror(fd) ) {
+                if ( err_count >= 10 ) {
+                    char err_text[255] = {0};
+                    sprintf(err_text,
+                            "Could not read the contents of the file (10 failed attempts at region %lu)",
+                            path_stat.st_size - to_read);
+                    PyEval_RestoreThread(_save);
+                    PyErr_SetString(PyExc_IOError, err_text);
+                    goto err_buf_cleanup;
+                }
+                err_count++;
+                struct timespec rem = {0};
+                if ( clock_gettime(CLOCK_MONOTONIC, &rem) ) {
+                    PyEval_RestoreThread(_save);
+                    PyErr_SetFromErrno(PyExc_OSError);
+                    goto err_buf_cleanup;
+                }
+                rem.tv_sec += 1 * ( int ) ((rem.tv_nsec + err_recovery_time.tv_nsec) >= 1000000);
+                rem.tv_nsec += err_recovery_time.tv_nsec;
+                rem.tv_nsec -= (1000000 * ( int ) (rem.tv_nsec >= 1000000));
+                if ( clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &rem, NULL) ) {
+                    PyEval_RestoreThread(_save);
+                    PyErr_SetFromErrno(PyExc_OSError);
+                    goto err_buf_cleanup;
+                }
+                clearerr(fd);
+                continue;
+            }
+        }
+        err_count = 0;
         to_read -= chunk_size;
         for ( uint32_t i = 0; i < chunk_size; i++ ) {
             counters[buf[i]]++;
         }
     }
     free(buf);
-    if ( fclose(fd) ) {
-        PyErr_SetFromErrno(PyExc_OSError);
-        return NULL;
-    }
+
+    // no check since if FD is invalid (and we didn't modify the struct) we can't recover and nothing to recover
+    fclose(fd);
 
     PyObject_INIT_VAR(retval, &PyBytes_Type, path_stat.st_size);
     retval->ob_shash = -1;
@@ -56,8 +118,15 @@ PyObject *BigStringSort_call(__attribute__((unused)) PyObject *self, PyObject *a
         memset(retval->ob_sval + position, char_val, counters[char_val]);
         position += counters[char_val];
     }
+    PyEval_RestoreThread(_save);
 
     return ( PyObject * ) retval;
+err_buf_cleanup:
+    free(buf);
+err_obj_cleanup:
+    fclose(fd);
+    PyObject_Free(retval);
+    return NULL;
 }
 
 __attribute__((unused)) PyMODINIT_FUNC PyInit_big_string_sort(void) {

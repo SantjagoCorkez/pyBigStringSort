@@ -39,7 +39,7 @@ with open(os.sep.join([os.path.dirname(os.path.abspath(__file__)), 'CMakeLists.t
 setup(
     name='big_string_sort',
     author='Andrey Semenov',
-    version='1.0',
+    version='1.1',
     description="C implementation of retrieving large sorted byte sequences from disk",
     python_requires=">=3.6",
     license='MIT',
