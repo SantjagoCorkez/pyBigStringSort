@@ -13,6 +13,16 @@ static const struct timespec err_recovery_time = {
     .tv_nsec = 100000000
 };
 
+static void BigStringSort__count_chars(size_t counters[],
+                                       const size_t chunk_size,
+                                       size_t *to_read,
+                                       const uint8_t *const buf) {
+    *to_read -= chunk_size;
+    for ( uint32_t i = 0; i < chunk_size; i++ ) {
+        counters[buf[i]]++;
+    }
+}
+
 PyObject *BigStringSort_call(__attribute__((unused)) PyObject *self, PyObject *arg) {
     PyThreadState *_save = PyEval_SaveThread();
     size_t counters[256] = {0};
@@ -63,6 +73,7 @@ PyObject *BigStringSort_call(__attribute__((unused)) PyObject *self, PyObject *a
     while ( to_read ) {
         size_t chunk_size = fread(buf, 1, BIG_STRING_SORT_BUFSIZE, fd);
         if ( chunk_size != BIG_STRING_SORT_BUFSIZE && chunk_size != to_read ) {
+            BigStringSort__count_chars(counters, chunk_size, &to_read, buf);
             if ( feof(fd) ) {
                 PyEval_RestoreThread(_save);
                 PyErr_SetString(PyExc_BrokenPipeError, "File was shrunk while being read");
@@ -85,9 +96,9 @@ PyObject *BigStringSort_call(__attribute__((unused)) PyObject *self, PyObject *a
                     PyErr_SetFromErrno(PyExc_OSError);
                     goto err_buf_cleanup;
                 }
-                rem.tv_sec += 1 * ( int ) ((rem.tv_nsec + err_recovery_time.tv_nsec) >= 1000000);
+                rem.tv_sec += 1 * ( int ) ((rem.tv_nsec + err_recovery_time.tv_nsec) >= 1000000000);
                 rem.tv_nsec += err_recovery_time.tv_nsec;
-                rem.tv_nsec -= (1000000 * ( int ) (rem.tv_nsec >= 1000000));
+                rem.tv_nsec -= (1000000000 * ( int ) (rem.tv_nsec >= 1000000000));
                 if ( clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &rem, NULL) ) {
                     PyEval_RestoreThread(_save);
                     PyErr_SetFromErrno(PyExc_OSError);
@@ -98,15 +109,17 @@ PyObject *BigStringSort_call(__attribute__((unused)) PyObject *self, PyObject *a
             }
         }
         err_count = 0;
-        to_read -= chunk_size;
-        for ( uint32_t i = 0; i < chunk_size; i++ ) {
-            counters[buf[i]]++;
-        }
+        BigStringSort__count_chars(counters, chunk_size, &to_read, buf);
     }
     free(buf);
 
-    // no check since if FD is invalid (and we didn't modify the struct) we can't recover and nothing to recover
-    fclose(fd);
+    // throws a ResourceWarning so a user could catch it and decide if there's a need to recover and how
+    // no hard recovery is needed since the main function is done and results are only needed to be properly returned
+    if ( fclose(fd) ) {
+        PyEval_RestoreThread(_save);
+        PyErr_WarnEx(PyExc_ResourceWarning, strerror(errno), 1);
+        _save = PyEval_SaveThread();
+    }
 
     PyObject_INIT_VAR(retval, &PyBytes_Type, path_stat.st_size);
     retval->ob_shash = -1;
